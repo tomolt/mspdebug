@@ -90,6 +90,9 @@ else
     else ifneq ($(filter $(UNAME_S),OpenBSD NetBSD DragonFly),)
 	PORTS_CFLAGS := $(shell pkg-config --cflags libusb)
 	PORTS_LDFLAGS := $(shell pkg-config --libs libusb) -ltermcap -pthread
+    else ifneq ($(filter $(UNAME_S),Linux),)
+	PORTS_CFLAGS := $(shell pkg-config --cflags libgpiod)
+	PORTS_LDFLAGS := $(shell pkg-config --libs libgpiod)
     else
 	PORTS_CFLAGS :=
 	PORTS_LDFLAGS :=
