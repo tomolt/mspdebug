@@ -197,6 +197,7 @@ OBJ=\
     drivers/jtaglib.o \
     drivers/mehfet_proto.o \
     drivers/mehfet.o \
+    drivers/picofet.o \
     drivers/pif.o \
     drivers/loadbsl.o \
     drivers/loadbsl_fw.o \
