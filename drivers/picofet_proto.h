@@ -22,7 +22,11 @@
 #ifndef PICOFET_PROTO_H_
 #define PICOFET_PROTO_H_
 
+#if 0
 #define PFET_USB_BAUD_RATE 460800
+#else
+#define PFET_USB_BAUD_RATE 115200
+#endif
 
 /* Not finalized yet */
 

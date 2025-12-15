@@ -33,7 +33,7 @@
 #include "util.h"
 #include "output.h"
 
-#define BUFFER_SIZE 1024
+#define BUFFER_SIZE 256
 
 struct pfet {
 	struct device device;
@@ -129,11 +129,6 @@ static int do_command(struct pfet *pfet, const char *format, ...)
 		return -1;
 	}
 
-	ok = pfet->tran->ops->flush(pfet->tran) >= 0;
-	if (!ok) {
-		return -1;
-	}
-
 	ok = recv_status(pfet, &status);
 	if (!ok) {
 		return -1;
@@ -145,9 +140,16 @@ static int do_command(struct pfet *pfet, const char *format, ...)
 static bool init_pfet(struct pfet *pfet)
 {
 	int status;
-	address_t capacity;
 	bool ok;
 
+	ok = pfet->tran->ops->set_modem(pfet->tran, TRANSPORT_MODEM_DTR) >= 0;
+	if (!ok) {
+		return false;
+	}
+
+#if 0
+	address_t capacity;
+	bool ok;
 	status = do_command(pfet, "BUF:CAPACITY\r\n");
 	if (status != STATUS_OK) {
 		printc_err("picofet: %03d\n", status);
@@ -158,6 +160,7 @@ static bool init_pfet(struct pfet *pfet)
 	if (!ok) {
 		return false;
 	}
+#endif
 
 	status = do_command(pfet, "MCU:ATTACH\r\n");
 	if (status != STATUS_OK) {
