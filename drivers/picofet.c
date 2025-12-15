@@ -19,7 +19,10 @@
  * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
  */
 
+#include <stdbool.h>
+#include <stdarg.h>
 #include <stdlib.h>
+#include <stdio.h>
 #include <string.h>
 
 #include "picofet.h"
@@ -30,21 +33,150 @@
 #include "util.h"
 #include "output.h"
 
+#define BUFFER_SIZE 1024
+
 struct pfet {
 	struct device device;
+	transport_t   tran;
+	char         *buffer;
+	unsigned      buffered;
 };
 
-/* Returns 1 on success, 0 on failure.
- */
-static int init_pfet(struct pfet *pfet)
+static char *wait_for_line(struct pfet *pfet)
 {
-	(void)pfet;
-	return 1;
+	char *lf;
+	int ret;
+
+	while (!(lf = memchr(pfet->buffer, '\n', pfet->buffered))) {
+		if (pfet->buffered == BUFFER_SIZE) {
+			return NULL;
+		}
+
+		ret = pfet->tran->ops->recv(pfet->tran,
+			(uint8_t *)pfet->buffer + pfet->buffered,
+			BUFFER_SIZE - pfet->buffered);
+		if (ret < 0) {
+			return NULL;
+		}
+
+		pfet->buffered += ret;
+	}
+
+	*lf = '\0';
+	if (lf > pfet->buffer && *(lf-1) == '\r') {
+		*(lf-1) = '\0';
+	}
+
+	return lf;
+}
+
+static void discard_line(struct pfet *pfet, char *lf)
+{
+	pfet->buffered -= lf + 1 - pfet->buffer;
+	memmove(pfet->buffer, lf + 1, pfet->buffered);
+}
+
+static bool recv_status(struct pfet *pfet, int *status)
+{
+	char *lf;
+
+	lf = wait_for_line(pfet);
+	if (!lf) {
+		return false;
+	}
+	if (status) {
+		*status = atoi(pfet->buffer);
+	}
+	discard_line(pfet, lf);
+
+	return true;
+}
+
+static bool recv_address(struct pfet *pfet, address_t *address)
+{
+	char *lf, *end;
+
+	lf = wait_for_line(pfet);
+	if (!lf) {
+		return false;
+	}
+	if (address) {
+		*address = strtoul(pfet->buffer, &end, 0);
+		if (pfet->buffer[0] == '\0' || *end != '\0') {
+			return false;
+		}
+	}
+	discard_line(pfet, lf);
+
+	return true;
+}
+
+static int do_command(struct pfet *pfet, const char *format, ...)
+{
+	va_list va;
+	int len, status;
+	bool ok;
+
+	va_start(va, format);
+	len = vsprintf(pfet->buffer, format, va);
+	if (len < 0) {
+		return -1;
+	}
+	va_end(va);
+
+	ok = pfet->tran->ops->send(pfet->tran, (uint8_t *)pfet->buffer, len) >= 0;
+	if (!ok) {
+		return -1;
+	}
+
+	ok = pfet->tran->ops->flush(pfet->tran) >= 0;
+	if (!ok) {
+		return -1;
+	}
+
+	ok = recv_status(pfet, &status);
+	if (!ok) {
+		return -1;
+	}
+
+	return status;
+}
+
+static bool init_pfet(struct pfet *pfet)
+{
+	int status;
+	address_t capacity;
+	bool ok;
+
+	status = do_command(pfet, "BUF:CAPACITY\r\n");
+	if (status != STATUS_OK) {
+		printc_err("picofet: %03d\n", status);
+		return false;
+	}
+
+	ok = recv_address(pfet, &capacity);
+	if (!ok) {
+		return false;
+	}
+
+	status = do_command(pfet, "MCU:ATTACH\r\n");
+	if (status != STATUS_OK) {
+		printc_err("picofet: %03d\n", status);
+		return false;
+	}
+
+	return true;
 }
 
 static void deinit_pfet(struct pfet *pfet)
 {
-	(void)pfet;
+	int status;
+	
+	status = do_command(pfet, "MCU:DETACH\r\n");
+	if (status != STATUS_OK) {
+		printc_err("picofet: %03d\n", status);
+		return;
+	}
 }
 
 static device_t pfet_open(const struct device_args *args)
@@ -83,9 +215,19 @@ static device_t pfet_open(const struct device_args *args)
 	pfet->device.type = &device_picofet;
 	//pfet->device.max_breakpoints = 2; // supported by all devices
 	pfet->device.need_probe = 1;
+	pfet->tran = tran;
+
+	pfet->buffer = malloc(BUFFER_SIZE);
+	if (!pfet->buffer) {
+		printc_err("picofet: malloc: %s\n", last_error());
+		tran->ops->destroy(tran);
+		free(pfet);
+		return NULL;
+	}
 
 	if (!init_pfet(pfet)) {
 		tran->ops->destroy(tran);
+		free(pfet->buffer);
 		free(pfet);
 		return NULL;
 	}
@@ -99,6 +241,8 @@ static void pfet_destroy(device_t dev)
 	if (!pfet) return;
 
 	deinit_pfet(pfet);
+	pfet->tran->ops->destroy(pfet->tran);
+	free(pfet->buffer);
 	free(pfet);
 }
 
