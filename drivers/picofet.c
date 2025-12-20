@@ -38,7 +38,7 @@
 struct pfet {
 	struct device device;
 	transport_t   tran;
-	char         *buffer;
+	char          *buffer;
 	unsigned      buffered;
 };
 
@@ -152,7 +152,7 @@ static bool init_pfet(struct pfet *pfet)
 	bool ok;
 	status = do_command(pfet, "BUF:CAPACITY\r\n");
 	if (status != STATUS_OK) {
-		printc_err("picofet: %03d\n", status);
+		printc_err("picofet: %03d: %s\n", status, pfet_get_status_message(status));
 		return false;
 	}
 
@@ -164,7 +164,7 @@ static bool init_pfet(struct pfet *pfet)
 
 	status = do_command(pfet, "MCU:ATTACH\r\n");
 	if (status != STATUS_OK) {
-		printc_err("picofet: %03d\n", status);
+		printc_err("picofet: %03d: %s\n", status, pfet_get_status_message(status));
 		return false;
 	}
 
@@ -197,9 +197,9 @@ static device_t pfet_open(const struct device_args *args)
 		return NULL;
 	}
 
-	tran = cdc_acm_open(args->path, args->requested_serial, PFET_USB_BAUD_RATE, 0x2E8A, 0x0009);
+	tran = cdc_acm_open(args->path, args->requested_serial, 115200, 0x2E8A, 0x0009);
 	if (!tran) {
-		tran = cdc_acm_open(args->path, args->requested_serial, PFET_USB_BAUD_RATE, 0x2E8A, 0x000A);
+		tran = cdc_acm_open(args->path, args->requested_serial, 115200, 0x2E8A, 0x000A);
 	}
 
 	if (!tran) {
@@ -250,7 +250,22 @@ static void pfet_destroy(device_t dev)
 }
 
 static int pfet_readmem(device_t dev, address_t addr, uint8_t *mem, address_t len)
-{
+{ 
+	struct pfet *pfet = (struct pfet *)dev;
+	int status;
+
+	status = do_command(pfet, "RAM:READ \r\n");
+	if (status < 0 || status >= 400) {
+		printc_err("picofet: %03d: %s\r\n", status, pfet_get_status_message(status));
+		return -1;
+	}
+
+	status = do_command(pfet, "BUF:DOWNLOAD \r\n");
+	if (status < 0 || status >= 400) {
+		printc_err("picofet: %03d: %s\r\n", status, pfet_get_status_message(status));
+		return -1;
+	}
+
 	return 0;
 }
 
@@ -276,7 +291,23 @@ static int pfet_setregs(device_t dev, const address_t *regs)
 
 static int pfet_ctl(device_t dev, device_ctl_t op)
 {
-	return 0;
+	switch (op) {
+	case DEVICE_CTL_RESET:
+		return 0;
+
+	case DEVICE_CTL_RUN:
+		return 0;
+
+	case DEVICE_CTL_HALT:
+		return 0;
+
+	case DEVICE_CTL_STEP:
+		return 0;
+
+	default:
+		printc_err("picofet: unsupported operation\n");
+		return -1;
+	}
 }
 
 static device_status_t pfet_poll(device_t dev)

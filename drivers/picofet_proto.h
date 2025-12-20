@@ -22,29 +22,39 @@
 #ifndef PICOFET_PROTO_H_
 #define PICOFET_PROTO_H_
 
-#if 0
-#define PFET_USB_BAUD_RATE 460800
-#else
-#define PFET_USB_BAUD_RATE 115200
-#endif
-
 /* Not finalized yet */
+#define PFET_DECLARE_STATUS_CODES(X)\
+	X(200, OK,                "Okay")\
+	X(500, UNKNOWN_COMMAND,   "Unknown Command")\
+	X(501, INVALID_ARGUMENTS, "Invalid Command Arguments")\
+	X(502, INTEGER_OVERFLOW,  "Integer Overflow")\
+	X(503, COMMAND_TOO_LONG,  "Command Too Long")\
+	X(550, FUSE_BLOWN,        "JTAG Security Fuse is blown")\
+	X(551, INVALID_JTAG_ID,   "Invalid JTAG ID")\
+	X(552, PUC_FAILED,        "PUC Failed")\
+	X(553, TOO_MANY_BREAKS,   "Too many Breakpoints")\
+	X(554, OUT_OF_BOUNDS,     "Address or Size is Out of Bounds")\
+	X(201, CONTENT_MISMATCH,  "Verification succeeded, but contents differ")\
+	X(350, CONTINUE_TRANSFER, "Go Ahead with Transfer")\
+	X(400, TIMED_OUT,         "JTAG connection with MCU timed out")\
+	X(401, TRANSFER_FAILED,   "Transfer failed")\
+	X(402, PROGRAMMER_FROZE,  "Programmer Froze")\
+	/* end of status code list */
 
-#define STATUS_OK                200
-#define STATUS_UNKNOWN_COMMAND   500
-#define STATUS_INVALID_ARGUMENTS 501
-#define STATUS_INTEGER_OVERFLOW  502
-#define STATUS_COMMAND_TOO_LONG  503
-#define STATUS_FUSE_BLOWN        550
-#define STATUS_INVALID_JTAG_ID   551
-#define STATUS_PUC_FAILED        552
-#define STATUS_TOO_MANY_BREAKS   553
-#define STATUS_OUT_OF_BOUNDS     554
+enum {
+#define PFET_MAKE_ENUM_(code, name, descr) STATUS_##name = code,
+	PFET_DECLARE_STATUS_CODES(PFET_MAKE_ENUM_)
+#undef PFET_MAKE_ENUM_
+};
 
-#define STATUS_CONTENT_MISMATCH  201
-#define STATUS_CONTINUE_TRANSFER 350
-#define STATUS_TIMED_OUT         400
-#define STATUS_TRANSFER_FAILED   401
-#define STATUS_PROGRAMMER_FROZE  402
+static inline const char *pfet_get_status_message(int status)
+{
+	switch (status) {
+#define PFET_MAKE_CASE_(code, name, descr) case code: return descr;
+	PFET_DECLARE_STATUS_CODES(PFET_MAKE_CASE_)
+#undef PFET_MAKE_CASE_
+	default: return "(Unrecognized Status Code)";
+	}
+}
 
 #endif
