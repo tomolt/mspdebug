@@ -33,6 +33,9 @@
 
 #include "util.h"
 #include "output.h"
+#include "ctrlc.h"
+
+// FIXME make sure strtoul() can't run off the end of the buffer (not NUL-terminated)
 
 #define MIN(a,b) ((a)<(b)?(a):(b))
 
@@ -45,15 +48,6 @@ struct pfet {
 	unsigned      buffered;
 	address_t     mcu_id;
 };
-
-static void printc_status(int status)
-{
-	if (status < 600) {
-		printc_err("picofet: %03d: %s\n", status, pfet_get_status_message(status));
-	} else {
-		printc_err("picofet: I/O error\n");
-	}
-}
 
 static char *wait_for_line(struct pfet *pfet)
 {
@@ -89,19 +83,27 @@ static void discard_line(struct pfet *pfet, char *lf)
 	memmove(pfet->buffer, lf + 1, pfet->buffered);
 }
 
-static bool recv_status(struct pfet *pfet, int *status)
+static bool recv_status(struct pfet *pfet, int *out_status)
 {
+	int status;
 	char *lf;
 
 	lf = wait_for_line(pfet);
 	if (!lf) {
+		printc_err("picofet: I/O error\n");
+		*out_status = 900;
 		return false;
 	}
-	if (status) {
-		*status = atoi(pfet->buffer);
+	status = atoi(pfet->buffer);
+	if (out_status) {
+		*out_status = status;
+	}
+	if (status >= 400) {
+		printc_err("picofet: %s\n", pfet->buffer);
+		discard_line(pfet, lf);
+		return false;
 	}
 	discard_line(pfet, lf);
-
 	return true;
 }
 
@@ -131,11 +133,7 @@ static int do_command(struct pfet *pfet, const char *format, ...)
 		return 900;
 	}
 
-	ok = recv_status(pfet, &status);
-	if (!ok) {
-		return 900;
-	}
-
+	recv_status(pfet, &status);
 	return status;
 }
 
@@ -152,7 +150,6 @@ static bool init_pfet(struct pfet *pfet)
 
 	status = do_command(pfet, "MCU:ATTACH\r\n");
 	if (status != STATUS_OK) {
-		printc_status(status);
 		return false;
 	}
 	lf = wait_for_line(pfet);
@@ -160,7 +157,6 @@ static bool init_pfet(struct pfet *pfet)
 
 	status = do_command(pfet, "MCU:GET_ID\r\n");
 	if (status >= 400) {
-		printc_status(status);
 		return -1;
 	}
 	lf = wait_for_line(pfet);
@@ -177,7 +173,6 @@ static void deinit_pfet(struct pfet *pfet)
 	
 	status = do_command(pfet, "MCU:DETACH 0x%"PRIx32"\r\n", pfet->mcu_id);
 	if (status != STATUS_OK) {
-		printc_status(status);
 		return;
 	}
 }
@@ -249,21 +244,18 @@ static void pfet_destroy(device_t dev)
 	free(pfet);
 }
 
-static int pfet_readmem(device_t dev, address_t addr, uint8_t *mem, address_t len)
-{ 
-	struct pfet *pfet = (struct pfet *)dev;
+static bool read_range(struct pfet *pfet, address_t addr, uint8_t *mem, address_t len)
+{
 	int status;
 
-	status = do_command(pfet, "RAM:READ 0 0x%"PRIx32 " %"PRIu32"\r\n", mem, len);
+	status = do_command(pfet, "RAM:READ 0 0x%"PRIx32 " %"PRIu32"\r\n", addr, len);
 	if (status >= 400) {
-		printc_status(status);
-		return -1;
+		return false;
 	}
 
 	status = do_command(pfet, "BUF:DOWNLOAD_BIN 0 %"PRIu32"\r\n", len);
 	if (status >= 400) {
-		printc_status(status);
-		return -1;
+		return false;
 	}
 
 	// Keep receiving bytes until we have downloaded the whole answer
@@ -282,37 +274,97 @@ static int pfet_readmem(device_t dev, address_t addr, uint8_t *mem, address_t le
 			(uint8_t *)pfet->buffer + pfet->buffered,
 			BUFFER_SIZE - pfet->buffered);
 		if (ret < 0) {
-			return -1;
+			return false;
 		}
 
 		pfet->buffered += ret;
 	}
 
+	return recv_status(pfet, NULL);
+}
+
+static int pfet_readmem(device_t dev, address_t addr, uint8_t *mem, address_t len)
+{ 
+	struct pfet *pfet = (struct pfet *)dev;
+	const struct chipinfo_memory *m;
+	address_t cursor = 0, rlen;
+	bool ok;
+
+	while (cursor < len) {
+		rlen = check_range(dev->chip, addr + cursor, len - cursor, &m);
+		if (m == NULL) {
+			printc_err("picofet: memory read out of range\n");
+			return -1;
+		}
+		ok = read_range(pfet, addr + cursor, mem + cursor, rlen);
+		if (!ok) {
+			return -1;
+		}
+		cursor += rlen;
+	}
+
 	return 0;
 }
 
-static int pfet_writemem(device_t dev, address_t addr, const uint8_t *mem, address_t len)
+static bool write_range(struct pfet *pfet, address_t addr, const uint8_t *mem, address_t len, const struct chipinfo_memory *meminfo)
 {
-	struct pfet *pfet = (struct pfet *)dev;
 	int status;
 	bool ok;
 
 	status = do_command(pfet, "BUF:UPLOAD_BIN 0 %" PRIu32 "\r\n", len);
 	if (status >= 400) {
-		printc_status(status);
-		return -1;
+		return false;
 	}
 
 	ok = pfet->tran->ops->send(pfet->tran, mem, len) >= 0;
-	if (ok) {
+	if (!ok) {
 		printc_err("picofet: I/O error during upload\n");
-		return -1;
+		return false;
+	}
+
+	if (!recv_status(pfet, NULL)) {
+		return false;
+	}
+
+	switch (meminfo->type) {
+	case CHIPINFO_MEMTYPE_RAM:
+		status = do_command(pfet, "RAM:WRITE 0 0x%"PRIx32" %"PRIu32"\r\n", addr, len);
+		break;
+
+	case CHIPINFO_MEMTYPE_FLASH:
+		status = do_command(pfet, "FLASH:WRITE 0 0x%"PRIx32" %"PRIu32"\r\n", addr, len);
+		break;
+
+	default:
+		printc_err("picofet: Attempting to write to memory range that isn't RAM or FLASH.\n");
+		return false;
 	}
 	
-	status = do_command(pfet, "RAM:WRITE 0 0x%"PRIx32" %"PRIu32"\r\n", mem, len);
 	if (status >= 400) {
-		printc_status(status);
-		return -1;
+		return false;
+	}
+
+	return true;
+}
+
+static int pfet_writemem(device_t dev, address_t addr, const uint8_t *mem, address_t len)
+{
+	struct pfet *pfet = (struct pfet *)dev;
+	const struct chipinfo_memory *m;
+	address_t cursor = 0, rlen;
+	bool ok;
+
+	while (cursor < len) {
+		rlen = check_range(dev->chip, addr + cursor, len - cursor, &m);
+		if (m == NULL) {
+			printc_err("picofet: memory write out of range\n");
+			return -1;
+		}
+		ok = write_range(pfet, addr + cursor, mem + cursor, rlen, m);
+		if (!ok) {
+			return -1;
+		}
+		cursor += rlen;
 	}
 
 	return 0;
@@ -320,7 +372,28 @@ static int pfet_writemem(device_t dev, address_t addr, const uint8_t *mem, addre
 
 static int pfet_erase(device_t dev, device_erase_type_t type, address_t address)
 {
-	return -1;
+	struct pfet *pfet = (struct pfet *)dev;
+	int status = STATUS_OK;
+
+	switch (type) {
+	case DEVICE_ERASE_ALL:
+		status = do_command(pfet, "FLASH:ERASE_ALL\r\n");
+		break;
+	case DEVICE_ERASE_MAIN:
+		status = do_command(pfet, "FLASH:ERASE_MAIN\r\n");
+		break;
+	case DEVICE_ERASE_SEGMENT:
+		status = do_command(pfet, "FLASH:ERASE_SEG 0x%"PRIx32"\r\n");
+		break;
+	default:
+		return -1;
+	}
+
+	if (status >= 400) {
+		return -1;
+	}
+
+	return 0;
 }
 
 static int pfet_getregs(device_t dev, address_t *regs)
@@ -333,7 +406,6 @@ static int pfet_getregs(device_t dev, address_t *regs)
 	for (int r = 0; r < DEVICE_NUM_REGS; r++) {
 		status = do_command(pfet, "REG:READ %d\r\n", r);
 		if (status >= 400) {
-			printc_status(status);
 			return -1;
 		}
 		lf = wait_for_line(pfet);
@@ -352,7 +424,6 @@ static int pfet_setregs(device_t dev, const address_t *regs)
 	for (int r = 0; r < DEVICE_NUM_REGS; r++) {
 		status = do_command(pfet, "REG:WRITE %d 0x%"PRIx32"\r\n", r, regs[r]);
 		if (status >= 400) {
-			printc_status(status);
 			return -1;
 		}
 	}
@@ -362,33 +433,79 @@ static int pfet_setregs(device_t dev, const address_t *regs)
 
 static int pfet_ctl(device_t dev, device_ctl_t op)
 {
+	struct pfet *pfet = (struct pfet *)dev;
+	int status;
+
 	switch (op) {
 	case DEVICE_CTL_RESET:
-		return 0;
+		status = do_command(pfet, "MCU:RESET\r\n");
+		break;
 
 	case DEVICE_CTL_RUN:
-		return 0;
+		// TODO transfer changed breakpoints to device
+		status = do_command(pfet, "MCU:CONTINUE\r\n");
+		break;
 
 	case DEVICE_CTL_HALT:
-		return 0;
+		status = do_command(pfet, "MCU:HALT\r\n");
+		break;
 
 	case DEVICE_CTL_STEP:
-		return 0;
+		status = do_command(pfet, "MCU:STEP\r\n");
+		break;
 
 	default:
 		printc_err("picofet: unsupported operation\n");
 		return -1;
 	}
+	if (status >= 400) {
+		return -1;
+	}
+
+	return 0;
 }
 
 static device_status_t pfet_poll(device_t dev)
 {
-	return DEVICE_STATUS_ERROR;
+	struct pfet *pfet = (struct pfet *)dev;
+	char *lf;
+	int status;
+
+	if (delay_ms(100) < 0 || ctrlc_check()) {
+		return DEVICE_STATUS_INTR;
+	}
+
+	status = do_command(pfet, "MCU:ATTACHED\r\n");
+	if (status >= 400) {
+		return DEVICE_STATUS_ERROR;
+	}
+	lf = wait_for_line(pfet);
+	unsigned long attached = strtoul(pfet->buffer, NULL, 0);
+	discard_line(pfet, lf);
+
+	if (attached) {
+		return DEVICE_STATUS_HALTED;
+	} else {
+		return DEVICE_STATUS_RUNNING;
+	}
 }
 
 static int pfet_getconfigfuses(device_t dev)
 {
-	return 0;
+	struct pfet *pfet = (struct pfet *)dev;
+	address_t fuses;
+	char *lf;
+	int status;
+
+	status = do_command(pfet, "FUSES:READ\r\n");
+	if (status >= 400) {
+		return -1;
+	}
+	lf = wait_for_line(pfet);
+	fuses = strtoul(pfet->buffer, NULL, 0);
+	discard_line(pfet, lf);
+
+	return fuses;
 }
 
 const struct device_class device_picofet = {
