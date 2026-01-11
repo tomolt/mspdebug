@@ -1,5 +1,5 @@
 /* MSPDebug - debugging tool for MSP430 MCUs
- * Copyright (C) 2025 Thomas Oltmann
+ * Copyright (C) 2025-2026 Thomas Oltmann
  *
  * PicoFET is an open-source firmware for the Raspberry Pi Pico and compatible
  * MCUs that turns them into MSP430-compatible JTAG debug probes.
