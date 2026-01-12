@@ -18,7 +18,7 @@
  * ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
  *
  * PicoFET is an open-source firmware for the Raspberry Pi Pico and compatible
- * MCUs that turns them into MSP430-compatible JTAG debuggers & programmers.
+ * MCUs that turns them into debuggers & programmers for MSP430 MCUs.
  */
 
 #include <stdbool.h>
@@ -27,6 +27,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <inttypes.h>
+#include <assert.h>
 
 #include "picofet.h"
 #include "cdc_acm.h"
@@ -37,6 +38,8 @@
 #define MIN(a,b) ((a)<(b)?(a):(b))
 
 #define BUFFER_SIZE 256
+
+#define PSEUDO_STATUS_IO_ERROR 600
 
 struct pfet {
 	struct device device;
@@ -52,7 +55,7 @@ static bool send_message(struct pfet *pfet, const void *data, address_t length)
 {
 	int ret = pfet->tran->ops->send(pfet->tran, data, length);
 	if (ret < 0) {
-		printc_err("picofet: I/O error\n");
+		printc_err("picofet: encountered I/O error.\n");
 		return false;
 	}
 	return true;
@@ -67,7 +70,7 @@ static bool wait_for_input(struct pfet *pfet)
 		(uint8_t *)pfet->buffer + pfet->buffered,
 		BUFFER_SIZE - pfet->buffered);
 	if (ret < 0) {
-		printc_err("picofet: I/O error\n");
+		printc_err("picofet: encountered I/O error.\n");
 		return false;
 	}
 	pfet->buffered += ret;
@@ -101,8 +104,9 @@ static int wait_for_line(struct pfet *pfet)
 	return lf + 1 - pfet->buffer;
 }
 
-static void discard_input(struct pfet *pfet, address_t num_bytes)
+static void discard_input(struct pfet *pfet, int num_bytes)
 {
+	assert(num_bytes >= 0);
 	pfet->buffered -= num_bytes;
 	memmove(pfet->buffer, pfet->buffer + num_bytes, pfet->buffered);
 
@@ -116,11 +120,13 @@ static bool recv_status(struct pfet *pfet, int *out_status)
 {
 	unsigned long status;
 	int input_length;
+	bool success;
 
 	input_length = wait_for_line(pfet);
 	if (input_length < 0) {
-		printc_err("picofet: I/O error\n");
-		*out_status = 900;
+		if (out_status) {
+			*out_status = PSEUDO_STATUS_IO_ERROR;
+		}
 		return false;
 	}
 	status = strtoul(pfet->buffer, NULL, 10);
@@ -128,11 +134,12 @@ static bool recv_status(struct pfet *pfet, int *out_status)
 		*out_status = status;
 	}
 	// We consider 1xx/2xx/3xx as success, 4xx/5xx as failure.
-	if (status >= 400) {
+	success = (status >= 100) && (status < 400);
+	if (!success) {
 		printc_err("picofet: %s\n", pfet->buffer);
 	}
 	discard_input(pfet, input_length);
-	return !(status >= 400);
+	return success;
 }
 
 /* Receives an address/machine word/integer from the PicoFET device.
@@ -163,12 +170,12 @@ static bool recv_address(struct pfet *pfet, address_t *out_addr)
 static bool do_command(struct pfet *pfet, int *out_status, const char *format, ...)
 {
 	va_list va;
-	int len;
+	int length;
 	bool ok;
 
 	// If we return before parsing the status code bc of an error, this is the code we'll return instead.
 	if (out_status) {
-		*out_status = 900;
+		*out_status = PSEUDO_STATUS_IO_ERROR;
 	}
 
 	if (pfet->buffered) {
@@ -178,13 +185,13 @@ static bool do_command(struct pfet *pfet, int *out_status, const char *format, .
 	pfet->buffered = 0;
 
 	va_start(va, format);
-	len = vsprintf(pfet->buffer, format, va);
-	if (len < 0) return false;
+	length = vsprintf(pfet->buffer, format, va);
+	if (length < 0) return false;
 	va_end(va);
 
-	printc_dbg("picofet: do_command: %.*s", len, pfet->buffer);
+	printc_dbg("picofet: do_command: %.*s", length, pfet->buffer);
 
-	ok = send_message(pfet, pfet->buffer, len);
+	ok = send_message(pfet, pfet->buffer, length);
 	if (!ok) return false;
 
 	return recv_status(pfet, out_status);
@@ -236,6 +243,8 @@ static device_t pfet_open(const struct device_args *args)
 		return NULL;
 	}
 
+	// Both RP2040 and RP2350 MCUs are supported, and they differ in USB product id,
+	// so we have to search for either id.
 	tran = cdc_acm_open(args->path, args->requested_serial, 115200, 0x2E8A, 0x0009);
 	if (!tran) {
 		tran = cdc_acm_open(args->path, args->requested_serial, 115200, 0x2E8A, 0x000A);
@@ -290,6 +299,7 @@ static void pfet_destroy(device_t dev)
 
 static bool read_range(struct pfet *pfet, address_t addr, uint8_t *mem, address_t len)
 {
+	address_t cursor;
 	bool ok;
 
 	ok = do_command(pfet, NULL, "RAM:READ 0 0x%"PRIx32 " %"PRIu32"\r\n", addr, len);
@@ -299,7 +309,7 @@ static bool read_range(struct pfet *pfet, address_t addr, uint8_t *mem, address_
 	if (!ok) return false;
 
 	// Keep receiving bytes until we have downloaded the whole answer
-	address_t cursor = 0;
+	cursor = 0;
 	for (;;) {
 		address_t step_size = MIN(len - cursor, pfet->buffered);
 		memcpy(mem + cursor, pfet->buffer, step_size);
@@ -314,35 +324,35 @@ static bool read_range(struct pfet *pfet, address_t addr, uint8_t *mem, address_
 	return recv_status(pfet, NULL);
 }
 
-static int pfet_readmem(device_t dev, address_t addr, uint8_t *mem, address_t len)
+static int pfet_readmem(device_t dev, address_t addr, uint8_t *mem, address_t num_bytes)
 { 
 	struct pfet *pfet = (struct pfet *)dev;
 	const struct chipinfo_memory *m;
-	address_t cursor = 0, rlen;
+	address_t cursor = 0, range_bytes;
 	bool ok;
 
-	while (cursor < len) {
-		rlen = check_range(dev->chip, addr + cursor, len - cursor, &m);
+	while (cursor < num_bytes) {
+		range_bytes = check_range(dev->chip, addr + cursor, num_bytes - cursor, &m);
 		if (m == NULL) {
 			printc_err("picofet: memory read out of range\n");
 			return -1;
 		}
-		ok = read_range(pfet, addr + cursor, mem + cursor, rlen);
+		ok = read_range(pfet, addr + cursor, mem + cursor, range_bytes);
 		if (!ok) return -1;
-		cursor += rlen;
+		cursor += range_bytes;
 	}
 
 	return 0;
 }
 
-static bool write_range(struct pfet *pfet, address_t addr, const uint8_t *mem, address_t len, const struct chipinfo_memory *meminfo)
+static bool write_range(struct pfet *pfet, address_t addr, const uint8_t *mem, address_t num_bytes, const struct chipinfo_memory *meminfo)
 {
 	bool ok;
 
-	ok = do_command(pfet, NULL, "BUF:UPLOAD_BIN 0 %" PRIu32 "\r\n", len);
+	ok = do_command(pfet, NULL, "BUF:UPLOAD_BIN 0 %" PRIu32 "\r\n", num_bytes);
 	if (!ok) return false;
 
-	ok = send_message(pfet, mem, len);
+	ok = send_message(pfet, mem, num_bytes);
 	if (!ok) return false;
 
 	ok = recv_status(pfet, NULL);
@@ -350,11 +360,11 @@ static bool write_range(struct pfet *pfet, address_t addr, const uint8_t *mem, a
 
 	switch (meminfo->type) {
 	case CHIPINFO_MEMTYPE_RAM:
-		ok = do_command(pfet, NULL, "RAM:WRITE 0 0x%"PRIx32" %"PRIu32"\r\n", addr, len);
+		ok = do_command(pfet, NULL, "RAM:WRITE 0 0x%"PRIx32" %"PRIu32"\r\n", addr, num_bytes);
 		return ok;
 
 	case CHIPINFO_MEMTYPE_FLASH:
-		ok = do_command(pfet, NULL, "FLASH:WRITE 0 0x%"PRIx32" %"PRIu32"\r\n", addr, len);
+		ok = do_command(pfet, NULL, "FLASH:WRITE 0 0x%"PRIx32" %"PRIu32"\r\n", addr, num_bytes);
 		return ok;
 
 	default:
@@ -363,22 +373,22 @@ static bool write_range(struct pfet *pfet, address_t addr, const uint8_t *mem, a
 	}
 }
 
-static int pfet_writemem(device_t dev, address_t addr, const uint8_t *mem, address_t len)
+static int pfet_writemem(device_t dev, address_t addr, const uint8_t *mem, address_t num_bytes)
 {
 	struct pfet *pfet = (struct pfet *)dev;
 	const struct chipinfo_memory *m;
-	address_t cursor = 0, rlen;
+	address_t cursor = 0, range_bytes;
 	bool ok;
 
-	while (cursor < len) {
-		rlen = check_range(dev->chip, addr + cursor, len - cursor, &m);
+	while (cursor < num_bytes) {
+		range_bytes = check_range(dev->chip, addr + cursor, num_bytes - cursor, &m);
 		if (m == NULL) {
-			printc_err("picofet: memory write out of range\n");
+			printc_err("picofet: memory write out of range.\n");
 			return -1;
 		}
-		ok = write_range(pfet, addr + cursor, mem + cursor, rlen, m);
+		ok = write_range(pfet, addr + cursor, mem + cursor, range_bytes, m);
 		if (!ok) return -1;
-		cursor += rlen;
+		cursor += range_bytes;
 	}
 
 	return 0;
@@ -400,6 +410,7 @@ static int pfet_erase(device_t dev, device_erase_type_t type, address_t address)
 		ok = do_command(pfet, NULL, "FLASH:ERASE_SEG 0x%"PRIx32"\r\n");
 		break;
 	default:
+		printc_err("picofet: attempting unknown type of erase operation.\n");
 		return -1;
 	}
 
@@ -459,7 +470,7 @@ static int pfet_ctl(device_t dev, device_ctl_t op)
 		break;
 
 	default:
-		printc_err("picofet: unsupported operation\n");
+		printc_err("picofet: operation is not supported.\n");
 		return -1;
 	}
 
@@ -500,7 +511,6 @@ static int pfet_getconfigfuses(device_t dev)
 
 	ok = do_command(pfet, NULL, "FUSES:READ\r\n");
 	if (!ok) return 0;
-	
 	ok = recv_address(pfet, &fuses);
 	if (!ok) return 0;
 
