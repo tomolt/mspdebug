@@ -122,10 +122,10 @@ static bool recv_address(struct pfet *pfet, address_t *out_addr)
 	return true;
 }
 
-static int do_command(struct pfet *pfet, const char *format, ...)
+static bool do_command(struct pfet *pfet, int *out_status, const char *format, ...)
 {
 	va_list va;
-	int len, status;
+	int len;
 	bool ok;
 
 	if (pfet->buffered) {
@@ -137,7 +137,10 @@ static int do_command(struct pfet *pfet, const char *format, ...)
 	va_start(va, format);
 	len = vsprintf(pfet->buffer, format, va);
 	if (len < 0) {
-		return 900;
+		if (out_status) {
+			*out_status = 900;
+		}
+		return false;
 	}
 	va_end(va);
 
@@ -145,16 +148,17 @@ static int do_command(struct pfet *pfet, const char *format, ...)
 
 	ok = pfet->tran->ops->send(pfet->tran, (uint8_t *)pfet->buffer, len) >= 0;
 	if (!ok) {
-		return 900;
+		if (out_status) {
+			*out_status = 900;
+		}
+		return false;
 	}
 
-	recv_status(pfet, &status);
-	return status;
+	return recv_status(pfet, out_status);
 }
 
 static bool init_pfet(struct pfet *pfet)
 {
-	int status;
 	bool ok;
 
 	ok = pfet->tran->ops->set_modem(pfet->tran, TRANSPORT_MODEM_DTR) >= 0;
@@ -162,8 +166,8 @@ static bool init_pfet(struct pfet *pfet)
 		return false;
 	}
 
-	status = do_command(pfet, "MCU:ATTACH\r\n");
-	if (status != STATUS_OK) {
+	ok = do_command(pfet, NULL, "MCU:ATTACH\r\n");
+	if (!ok) {
 		return false;
 	}
 	ok = recv_address(pfet, NULL);
@@ -171,9 +175,9 @@ static bool init_pfet(struct pfet *pfet)
 		return false;
 	}
 
-	status = do_command(pfet, "MCU:GET_ID\r\n");
-	if (status >= 400) {
-		return -1;
+	ok = do_command(pfet, NULL, "MCU:GET_ID\r\n");
+	if (!ok) {
+		return false;
 	}
 	ok = recv_address(pfet, &pfet->mcu_id);
 	if (!ok) {
@@ -186,10 +190,10 @@ static bool init_pfet(struct pfet *pfet)
 
 static void deinit_pfet(struct pfet *pfet)
 {
-	int status;
+	bool ok;
 	
-	status = do_command(pfet, "MCU:DETACH 0x%"PRIx32"\r\n", pfet->mcu_id);
-	if (status != STATUS_OK) {
+	ok = do_command(pfet, NULL, "MCU:DETACH 0x%"PRIx32"\r\n", pfet->mcu_id);
+	if (!ok) {
 		return;
 	}
 }
@@ -263,15 +267,15 @@ static void pfet_destroy(device_t dev)
 
 static bool read_range(struct pfet *pfet, address_t addr, uint8_t *mem, address_t len)
 {
-	int status;
+	bool ok;
 
-	status = do_command(pfet, "RAM:READ 0 0x%"PRIx32 " %"PRIu32"\r\n", addr, len);
-	if (status >= 400) {
+	ok = do_command(pfet, NULL, "RAM:READ 0 0x%"PRIx32 " %"PRIu32"\r\n", addr, len);
+	if (!ok) {
 		return false;
 	}
 
-	status = do_command(pfet, "BUF:DOWNLOAD_BIN 0 %"PRIu32"\r\n", len);
-	if (status >= 400) {
+	ok = do_command(pfet, NULL, "BUF:DOWNLOAD_BIN 0 %"PRIu32"\r\n", len);
+	if (!ok) {
 		return false;
 	}
 
@@ -325,11 +329,10 @@ static int pfet_readmem(device_t dev, address_t addr, uint8_t *mem, address_t le
 
 static bool write_range(struct pfet *pfet, address_t addr, const uint8_t *mem, address_t len, const struct chipinfo_memory *meminfo)
 {
-	int status;
 	bool ok;
 
-	status = do_command(pfet, "BUF:UPLOAD_BIN 0 %" PRIu32 "\r\n", len);
-	if (status >= 400) {
+	ok = do_command(pfet, NULL, "BUF:UPLOAD_BIN 0 %" PRIu32 "\r\n", len);
+	if (!ok) {
 		return false;
 	}
 
@@ -339,29 +342,24 @@ static bool write_range(struct pfet *pfet, address_t addr, const uint8_t *mem, a
 		return false;
 	}
 
-	if (!recv_status(pfet, NULL)) {
+	ok = recv_status(pfet, NULL);
+	if (!ok) {
 		return false;
 	}
 
 	switch (meminfo->type) {
 	case CHIPINFO_MEMTYPE_RAM:
-		status = do_command(pfet, "RAM:WRITE 0 0x%"PRIx32" %"PRIu32"\r\n", addr, len);
-		break;
+		ok = do_command(pfet, NULL, "RAM:WRITE 0 0x%"PRIx32" %"PRIu32"\r\n", addr, len);
+		return ok;
 
 	case CHIPINFO_MEMTYPE_FLASH:
-		status = do_command(pfet, "FLASH:WRITE 0 0x%"PRIx32" %"PRIu32"\r\n", addr, len);
-		break;
+		ok = do_command(pfet, NULL, "FLASH:WRITE 0 0x%"PRIx32" %"PRIu32"\r\n", addr, len);
+		return ok;
 
 	default:
 		printc_err("picofet: Attempting to write to memory range that isn't RAM or FLASH.\n");
 		return false;
 	}
-	
-	if (status >= 400) {
-		return false;
-	}
-
-	return true;
 }
 
 static int pfet_writemem(device_t dev, address_t addr, const uint8_t *mem, address_t len)
@@ -390,39 +388,34 @@ static int pfet_writemem(device_t dev, address_t addr, const uint8_t *mem, addre
 static int pfet_erase(device_t dev, device_erase_type_t type, address_t address)
 {
 	struct pfet *pfet = (struct pfet *)dev;
-	int status = STATUS_OK;
+	bool ok;
 
 	switch (type) {
 	case DEVICE_ERASE_ALL:
-		status = do_command(pfet, "FLASH:ERASE_ALL\r\n");
+		ok = do_command(pfet, NULL, "FLASH:ERASE_ALL\r\n");
 		break;
 	case DEVICE_ERASE_MAIN:
-		status = do_command(pfet, "FLASH:ERASE_MAIN\r\n");
+		ok = do_command(pfet, NULL, "FLASH:ERASE_MAIN\r\n");
 		break;
 	case DEVICE_ERASE_SEGMENT:
-		status = do_command(pfet, "FLASH:ERASE_SEG 0x%"PRIx32"\r\n");
+		ok = do_command(pfet, NULL, "FLASH:ERASE_SEG 0x%"PRIx32"\r\n");
 		break;
 	default:
 		return -1;
 	}
 
-	if (status >= 400) {
-		return -1;
-	}
-
-	return 0;
+	return ok ? 0 : -1;
 }
 
 static int pfet_getregs(device_t dev, address_t *regs)
 {
 	struct pfet *pfet = (struct pfet *)dev;
-	int status;
 	bool ok;
 
 	memset(regs, 0, DEVICE_NUM_REGS * sizeof (*regs));
 	for (int r = 0; r < DEVICE_NUM_REGS; r++) {
-		status = do_command(pfet, "REG:READ %d\r\n", r);
-		if (status >= 400) {
+		ok = do_command(pfet, NULL, "REG:READ %d\r\n", r);
+		if (!ok) {
 			return -1;
 		}
 		ok = recv_address(pfet, &regs[r]);
@@ -437,11 +430,11 @@ static int pfet_getregs(device_t dev, address_t *regs)
 static int pfet_setregs(device_t dev, const address_t *regs)
 {
 	struct pfet *pfet = (struct pfet *)dev;
-	int status;
+	bool ok;
 
 	for (int r = 0; r < DEVICE_NUM_REGS; r++) {
-		status = do_command(pfet, "REG:WRITE %d 0x%"PRIx32"\r\n", r, regs[r]);
-		if (status >= 400) {
+		ok = do_command(pfet, NULL, "REG:WRITE %d 0x%"PRIx32"\r\n", r, regs[r]);
+		if (!ok) {
 			return -1;
 		}
 	}
@@ -452,56 +445,47 @@ static int pfet_setregs(device_t dev, const address_t *regs)
 static int pfet_ctl(device_t dev, device_ctl_t op)
 {
 	struct pfet *pfet = (struct pfet *)dev;
-	int status;
-
 	switch (op) {
 	case DEVICE_CTL_RESET:
-		status = do_command(pfet, "MCU:RESET\r\n");
-		break;
+		return do_command(pfet, NULL, "MCU:RESET\r\n");
 
 	case DEVICE_CTL_RUN:
 		// TODO transfer changed breakpoints to device
-		status = do_command(pfet, "MCU:CONTINUE\r\n");
-		break;
+		return do_command(pfet, NULL, "MCU:CONTINUE\r\n");
 
 	case DEVICE_CTL_HALT:
-		status = do_command(pfet, "MCU:HALT\r\n");
-		break;
+		return do_command(pfet, NULL, "MCU:HALT\r\n");
 
 	case DEVICE_CTL_STEP:
-		status = do_command(pfet, "MCU:STEP\r\n");
-		break;
+		return do_command(pfet, NULL, "MCU:STEP\r\n");
 
 	default:
 		printc_err("picofet: unsupported operation\n");
 		return -1;
 	}
-	if (status >= 400) {
-		return -1;
-	}
-
-	return 0;
 }
 
 static device_status_t pfet_poll(device_t dev)
 {
 	struct pfet *pfet = (struct pfet *)dev;
-	char *lf;
-	int status;
+	address_t halted;
+	bool ok;
 
 	if (delay_ms(100) < 0 || ctrlc_check()) {
 		return DEVICE_STATUS_INTR;
 	}
 
-	status = do_command(pfet, "MCU:IS_HALTED\r\n");
-	if (status >= 400) {
+	ok = do_command(pfet, NULL, "MCU:IS_HALTED\r\n");
+	if (!ok) {
 		return DEVICE_STATUS_ERROR;
 	}
-	lf = wait_for_line(pfet);
-	unsigned long attached = strtoul(pfet->buffer, NULL, 0);
-	discard_line(pfet, lf);
 
-	if (attached) {
+	ok = recv_address(pfet, &halted);
+	if (!ok) {
+		return DEVICE_STATUS_ERROR;
+	}
+
+	if (halted) {
 		return DEVICE_STATUS_HALTED;
 	} else {
 		return DEVICE_STATUS_RUNNING;
@@ -512,16 +496,17 @@ static int pfet_getconfigfuses(device_t dev)
 {
 	struct pfet *pfet = (struct pfet *)dev;
 	address_t fuses;
-	char *lf;
-	int status;
+	bool ok;
 
-	status = do_command(pfet, "FUSES:READ\r\n");
-	if (status >= 400) {
-		return -1;
+	ok = do_command(pfet, NULL, "FUSES:READ\r\n");
+	if (!ok) {
+		return 0;
 	}
-	lf = wait_for_line(pfet);
-	fuses = strtoul(pfet->buffer, NULL, 0);
-	discard_line(pfet, lf);
+	
+	ok = recv_address(pfet, &fuses);
+	if (!ok) {
+		return 0;
+	}
 
 	return fuses;
 }
