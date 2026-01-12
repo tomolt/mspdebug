@@ -1,9 +1,6 @@
 /* MSPDebug - debugging tool for MSP430 MCUs
  * Copyright (C) 2025-2026 Thomas Oltmann
  *
- * PicoFET is an open-source firmware for the Raspberry Pi Pico and compatible
- * MCUs that turns them into MSP430-compatible JTAG debug probes.
- *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
  * the Free Software Foundation; either version 2 of the License, or
@@ -17,6 +14,11 @@
  * You should have received a copy of the GNU General Public License
  * along with this program; if not, write to the Free Software
  * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
+ *
+ * ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+ *
+ * PicoFET is an open-source firmware for the Raspberry Pi Pico and compatible
+ * MCUs that turns them into MSP430-compatible JTAG debuggers & programmers.
  */
 
 #include <stdbool.h>
@@ -47,24 +49,51 @@ struct pfet {
 	address_t     mcu_id;
 };
 
-static char *wait_for_line(struct pfet *pfet)
+/* Sends a number of bytes to the PicoFET device.
+ */
+static bool send_message(struct pfet *pfet, const void *data, address_t length)
+{
+	int ret = pfet->tran->ops->send(pfet->tran, data, length);
+	if (ret < 0) {
+		printc_err("picofet: I/O error\n");
+		return false;
+	}
+	return true;
+}
+
+/* Waits until we have received some bytes from the PicoFET device,
+ * and stores them in the (input) buffer in the pfet struct.
+ */
+static bool wait_for_input(struct pfet *pfet)
+{
+	int ret = pfet->tran->ops->recv(pfet->tran,
+		(uint8_t *)pfet->buffer + pfet->buffered,
+		BUFFER_SIZE - pfet->buffered);
+	if (ret < 0) {
+		printc_err("picofet: I/O error\n");
+		return false;
+	}
+	pfet->buffered += ret;
+	return true;
+}
+
+/* Waits until we have received a whole line (delimited by CR LF) from the PicoFET device.
+ * The line delimiter bytes are overwritten in-place with NUL characters.
+ * On success, returns the number of bytes in the line (including the line delimiters).
+ * On I/O failure, returns a negative value.
+ */
+static int wait_for_line(struct pfet *pfet)
 {
 	char *lf;
-	int ret;
+	bool ok;
 
 	while (!(lf = memchr(pfet->buffer, '\n', pfet->buffered))) {
 		if (pfet->buffered == BUFFER_SIZE) {
-			return NULL;
+			return -1;
 		}
 
-		ret = pfet->tran->ops->recv(pfet->tran,
-			(uint8_t *)pfet->buffer + pfet->buffered,
-			BUFFER_SIZE - pfet->buffered);
-		if (ret < 0) {
-			return NULL;
-		}
-
-		pfet->buffered += ret;
+		ok = wait_for_input(pfet);
+		if (!ok) return -1;
 	}
 
 	*lf = '\0';
@@ -72,45 +101,52 @@ static char *wait_for_line(struct pfet *pfet)
 		*(lf-1) = '\0';
 	}
 
-	return lf;
+	return lf + 1 - pfet->buffer;
 }
 
-static void discard_line(struct pfet *pfet, char *lf)
+static void discard_input(struct pfet *pfet, address_t num_bytes)
 {
-	pfet->buffered -= lf + 1 - pfet->buffer;
-	memmove(pfet->buffer, lf + 1, pfet->buffered);
+	pfet->buffered -= num_bytes;
+	memmove(pfet->buffer, pfet->buffer + num_bytes, pfet->buffered);
+
 }
 
+/* Receives a status code.
+ * Status codes are three-digit numbers akin to FTP status codes.
+ * This function only returns true if a status code was received and the code indicates success.
+ */
 static bool recv_status(struct pfet *pfet, int *out_status)
 {
-	int status;
-	char *lf;
+	unsigned long status;
+	int input_length;
 
-	lf = wait_for_line(pfet);
-	if (!lf) {
+	input_length = wait_for_line(pfet);
+	if (input_length < 0) {
 		printc_err("picofet: I/O error\n");
 		*out_status = 900;
 		return false;
 	}
-	status = atoi(pfet->buffer);
+	status = strtoul(pfet->buffer, NULL, 10);
 	if (out_status) {
 		*out_status = status;
 	}
+	// We consider 1xx/2xx/3xx as success, 4xx/5xx as failure.
 	if (status >= 400) {
 		printc_err("picofet: %s\n", pfet->buffer);
-		discard_line(pfet, lf);
-		return false;
 	}
-	discard_line(pfet, lf);
-	return true;
+	discard_input(pfet, input_length);
+	return !(status >= 400);
 }
 
+/* Receives an address/machine word/integer from the PicoFET device.
+ * These are formatted as a line of text containing a single (hexadecimal) human-readable integer.
+ */
 static bool recv_address(struct pfet *pfet, address_t *out_addr)
 {
-	char *lf;
+	int input_length;
 
-	lf = wait_for_line(pfet);
-	if (!lf) {
+	input_length = wait_for_line(pfet);
+	if (input_length < 0) {
 		printc_err("picofet: I/O error\n");
 		*out_addr = 0;
 		return false;
@@ -118,15 +154,25 @@ static bool recv_address(struct pfet *pfet, address_t *out_addr)
 	if (out_addr) {
 		*out_addr = strtoul(pfet->buffer, NULL, 0);
 	}
-	discard_line(pfet, lf);
+	discard_input(pfet, input_length);
 	return true;
 }
 
+/* Sends a human-readable command to the PicoFET device, and receive the resulting status code.
+ * The command can be formatted with standard printf() format specifiers.
+ * This function optionally stores the received status in *out_status.
+ * It only returns true if the command was completed and returned a successful status code.
+ */
 static bool do_command(struct pfet *pfet, int *out_status, const char *format, ...)
 {
 	va_list va;
 	int len;
 	bool ok;
+
+	// If we return before parsing the status code bc of an error, this is the code we'll return instead.
+	if (out_status) {
+		*out_status = 900;
+	}
 
 	if (pfet->buffered) {
 		// Theoretically, this should not happen, as we operate in half-duplex mode.
@@ -136,23 +182,13 @@ static bool do_command(struct pfet *pfet, int *out_status, const char *format, .
 
 	va_start(va, format);
 	len = vsprintf(pfet->buffer, format, va);
-	if (len < 0) {
-		if (out_status) {
-			*out_status = 900;
-		}
-		return false;
-	}
+	if (len < 0) return false;
 	va_end(va);
 
 	printc_dbg("picofet: do_command: %.*s", len, pfet->buffer);
 
-	ok = pfet->tran->ops->send(pfet->tran, (uint8_t *)pfet->buffer, len) >= 0;
-	if (!ok) {
-		if (out_status) {
-			*out_status = 900;
-		}
-		return false;
-	}
+	ok = send_message(pfet, pfet->buffer, len);
+	if (!ok) return false;
 
 	return recv_status(pfet, out_status);
 }
@@ -161,6 +197,7 @@ static bool init_pfet(struct pfet *pfet)
 {
 	bool ok;
 
+	// Set DTR, otherwise USB device wouldn't recognize that the connection has been established.
 	ok = pfet->tran->ops->set_modem(pfet->tran, TRANSPORT_MODEM_DTR) >= 0;
 	if (!ok) return false;
 
@@ -267,20 +304,14 @@ static bool read_range(struct pfet *pfet, address_t addr, uint8_t *mem, address_
 	// Keep receiving bytes until we have downloaded the whole answer
 	address_t cursor = 0;
 	for (;;) {
-		address_t chunk = MIN(len - cursor, pfet->buffered);
-		memcpy(mem + cursor, pfet->buffer, chunk);
-		cursor += chunk;
-		pfet->buffered -= chunk;
-		memmove(pfet->buffer, pfet->buffer + chunk, pfet->buffered);
-		if (cursor == len) {
-			break;
-		}
+		address_t step_size = MIN(len - cursor, pfet->buffered);
+		memcpy(mem + cursor, pfet->buffer, step_size);
+		cursor += step_size;
+		discard_input(pfet, step_size);
+		if (cursor == len) break;
 
-		int ret = pfet->tran->ops->recv(pfet->tran,
-			(uint8_t *)pfet->buffer + pfet->buffered,
-			BUFFER_SIZE - pfet->buffered);
-		if (ret < 0) return false;
-		pfet->buffered += ret;
+		ok = wait_for_input(pfet);
+		if (!ok) return false;
 	}
 
 	return recv_status(pfet, NULL);
@@ -314,11 +345,8 @@ static bool write_range(struct pfet *pfet, address_t addr, const uint8_t *mem, a
 	ok = do_command(pfet, NULL, "BUF:UPLOAD_BIN 0 %" PRIu32 "\r\n", len);
 	if (!ok) return false;
 
-	ok = pfet->tran->ops->send(pfet->tran, mem, len) >= 0;
-	if (!ok) {
-		printc_err("picofet: I/O error during upload\n");
-		return false;
-	}
+	ok = send_message(pfet, mem, len);
+	if (!ok) return false;
 
 	ok = recv_status(pfet, NULL);
 	if (!ok) return false;
