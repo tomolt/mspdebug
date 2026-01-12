@@ -35,8 +35,6 @@
 #include "output.h"
 #include "ctrlc.h"
 
-// FIXME make sure strtoul() can't run off the end of the buffer (not NUL-terminated)
-
 #define MIN(a,b) ((a)<(b)?(a):(b))
 
 #define BUFFER_SIZE 256
@@ -107,6 +105,23 @@ static bool recv_status(struct pfet *pfet, int *out_status)
 	return true;
 }
 
+static bool recv_address(struct pfet *pfet, address_t *out_addr)
+{
+	char *lf;
+
+	lf = wait_for_line(pfet);
+	if (!lf) {
+		printc_err("picofet: I/O error\n");
+		*out_addr = 0;
+		return false;
+	}
+	if (out_addr) {
+		*out_addr = strtoul(pfet->buffer, NULL, 0);
+	}
+	discard_line(pfet, lf);
+	return true;
+}
+
 static int do_command(struct pfet *pfet, const char *format, ...)
 {
 	va_list va;
@@ -139,7 +154,6 @@ static int do_command(struct pfet *pfet, const char *format, ...)
 
 static bool init_pfet(struct pfet *pfet)
 {
-	char *lf;
 	int status;
 	bool ok;
 
@@ -152,16 +166,19 @@ static bool init_pfet(struct pfet *pfet)
 	if (status != STATUS_OK) {
 		return false;
 	}
-	lf = wait_for_line(pfet);
-	discard_line(pfet, lf);
+	ok = recv_address(pfet, NULL);
+	if (!ok) {
+		return false;
+	}
 
 	status = do_command(pfet, "MCU:GET_ID\r\n");
 	if (status >= 400) {
 		return -1;
 	}
-	lf = wait_for_line(pfet);
-	pfet->mcu_id = strtoul(pfet->buffer, NULL, 0);
-	discard_line(pfet, lf);
+	ok = recv_address(pfet, &pfet->mcu_id);
+	if (!ok) {
+		return false;
+	}
 	printc("picofet: attached to mcu 0x%"PRIx32"\n", pfet->mcu_id);
 
 	return true;
@@ -400,7 +417,7 @@ static int pfet_getregs(device_t dev, address_t *regs)
 {
 	struct pfet *pfet = (struct pfet *)dev;
 	int status;
-	char *lf;
+	bool ok;
 
 	memset(regs, 0, DEVICE_NUM_REGS * sizeof (*regs));
 	for (int r = 0; r < DEVICE_NUM_REGS; r++) {
@@ -408,9 +425,10 @@ static int pfet_getregs(device_t dev, address_t *regs)
 		if (status >= 400) {
 			return -1;
 		}
-		lf = wait_for_line(pfet);
-		regs[r] = strtoul(pfet->buffer, NULL, 0);
-		discard_line(pfet, lf);
+		ok = recv_address(pfet, &regs[r]);
+		if (!ok) {
+			return -1;
+		}
 	}
 
 	return 0;
@@ -475,7 +493,7 @@ static device_status_t pfet_poll(device_t dev)
 		return DEVICE_STATUS_INTR;
 	}
 
-	status = do_command(pfet, "MCU:ATTACHED\r\n");
+	status = do_command(pfet, "MCU:IS_HALTED\r\n");
 	if (status >= 400) {
 		return DEVICE_STATUS_ERROR;
 	}
