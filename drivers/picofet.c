@@ -29,10 +29,7 @@
 #include <inttypes.h>
 
 #include "picofet.h"
-#include "picofet_proto.h"
-
 #include "cdc_acm.h"
-
 #include "util.h"
 #include "output.h"
 #include "ctrlc.h"
