@@ -18,7 +18,7 @@
  * ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
  *
  * PicoFET is an open-source firmware for the Raspberry Pi Pico and compatible
- * MCUs that turns them into debuggers & programmers for MSP430 MCUs.
+ * boards that turns them into debuggers & programmers for TI MSP430 family MCUs.
  */
 
 #include <stdbool.h>
@@ -37,9 +37,9 @@
 
 #define MIN(a,b) ((a)<(b)?(a):(b))
 
-#define BUFFER_SIZE 256
-
 #define PSEUDO_STATUS_IO_ERROR 600
+
+#define BUFFER_SIZE 256
 
 struct pfet {
 	struct device device;
@@ -109,7 +109,6 @@ static void discard_input(struct pfet *pfet, int num_bytes)
 	assert(num_bytes >= 0);
 	pfet->buffered -= num_bytes;
 	memmove(pfet->buffer, pfet->buffer + num_bytes, pfet->buffered);
-
 }
 
 /* Receives a status code.
@@ -228,6 +227,61 @@ static void deinit_pfet(struct pfet *pfet)
 	if (!ok) return;
 }
 
+static bool read_range(struct pfet *pfet, address_t addr, uint8_t *mem, address_t len)
+{
+	address_t cursor;
+	bool ok;
+
+	ok = do_command(pfet, NULL, "RAM:READ 0 0x%"PRIx32 " %"PRIu32"\r\n", addr, len);
+	if (!ok) return false;
+
+	ok = do_command(pfet, NULL, "BUF:DOWNLOAD_BIN 0 %"PRIu32"\r\n", len);
+	if (!ok) return false;
+
+	// Keep receiving bytes until we have downloaded the whole answer
+	cursor = 0;
+	for (;;) {
+		address_t step_size = MIN(len - cursor, pfet->buffered);
+		memcpy(mem + cursor, pfet->buffer, step_size);
+		cursor += step_size;
+		discard_input(pfet, step_size);
+		if (cursor == len) break;
+
+		ok = wait_for_input(pfet);
+		if (!ok) return false;
+	}
+
+	return recv_status(pfet, NULL);
+}
+
+static bool write_range(struct pfet *pfet, address_t addr, const uint8_t *mem, address_t num_bytes, const struct chipinfo_memory *meminfo)
+{
+	bool ok;
+
+	ok = do_command(pfet, NULL, "BUF:UPLOAD_BIN 0 %" PRIu32 "\r\n", num_bytes);
+	if (!ok) return false;
+
+	ok = send_message(pfet, mem, num_bytes);
+	if (!ok) return false;
+
+	ok = recv_status(pfet, NULL);
+	if (!ok) return false;
+
+	switch (meminfo->type) {
+	case CHIPINFO_MEMTYPE_RAM:
+		ok = do_command(pfet, NULL, "RAM:WRITE 0 0x%"PRIx32" %"PRIu32"\r\n", addr, num_bytes);
+		return ok;
+
+	case CHIPINFO_MEMTYPE_FLASH:
+		ok = do_command(pfet, NULL, "FLASH:WRITE 0 0x%"PRIx32" %"PRIu32"\r\n", addr, num_bytes);
+		return ok;
+
+	default:
+		printc_err("picofet: Attempting to write to memory range that isn't RAM or FLASH.\n");
+		return false;
+	}
+}
+
 static device_t pfet_open(const struct device_args *args)
 {
 	struct pfet *pfet;
@@ -297,33 +351,6 @@ static void pfet_destroy(device_t dev)
 	free(pfet);
 }
 
-static bool read_range(struct pfet *pfet, address_t addr, uint8_t *mem, address_t len)
-{
-	address_t cursor;
-	bool ok;
-
-	ok = do_command(pfet, NULL, "RAM:READ 0 0x%"PRIx32 " %"PRIu32"\r\n", addr, len);
-	if (!ok) return false;
-
-	ok = do_command(pfet, NULL, "BUF:DOWNLOAD_BIN 0 %"PRIu32"\r\n", len);
-	if (!ok) return false;
-
-	// Keep receiving bytes until we have downloaded the whole answer
-	cursor = 0;
-	for (;;) {
-		address_t step_size = MIN(len - cursor, pfet->buffered);
-		memcpy(mem + cursor, pfet->buffer, step_size);
-		cursor += step_size;
-		discard_input(pfet, step_size);
-		if (cursor == len) break;
-
-		ok = wait_for_input(pfet);
-		if (!ok) return false;
-	}
-
-	return recv_status(pfet, NULL);
-}
-
 static int pfet_readmem(device_t dev, address_t addr, uint8_t *mem, address_t num_bytes)
 { 
 	struct pfet *pfet = (struct pfet *)dev;
@@ -345,34 +372,6 @@ static int pfet_readmem(device_t dev, address_t addr, uint8_t *mem, address_t nu
 	return 0;
 }
 
-static bool write_range(struct pfet *pfet, address_t addr, const uint8_t *mem, address_t num_bytes, const struct chipinfo_memory *meminfo)
-{
-	bool ok;
-
-	ok = do_command(pfet, NULL, "BUF:UPLOAD_BIN 0 %" PRIu32 "\r\n", num_bytes);
-	if (!ok) return false;
-
-	ok = send_message(pfet, mem, num_bytes);
-	if (!ok) return false;
-
-	ok = recv_status(pfet, NULL);
-	if (!ok) return false;
-
-	switch (meminfo->type) {
-	case CHIPINFO_MEMTYPE_RAM:
-		ok = do_command(pfet, NULL, "RAM:WRITE 0 0x%"PRIx32" %"PRIu32"\r\n", addr, num_bytes);
-		return ok;
-
-	case CHIPINFO_MEMTYPE_FLASH:
-		ok = do_command(pfet, NULL, "FLASH:WRITE 0 0x%"PRIx32" %"PRIu32"\r\n", addr, num_bytes);
-		return ok;
-
-	default:
-		printc_err("picofet: Attempting to write to memory range that isn't RAM or FLASH.\n");
-		return false;
-	}
-}
-
 static int pfet_writemem(device_t dev, address_t addr, const uint8_t *mem, address_t num_bytes)
 {
 	struct pfet *pfet = (struct pfet *)dev;
@@ -392,6 +391,43 @@ static int pfet_writemem(device_t dev, address_t addr, const uint8_t *mem, addre
 	}
 
 	return 0;
+}
+
+static bool pfet_refresh_bps(device_t dev, struct pfet *pfet)
+{
+	int i;
+	struct device_breakpoint *bp;
+	address_t addr;
+	bool ok, all_ok = true;
+
+	for (i = 0; i < dev->max_breakpoints; i++) {
+		bp = &dev->breakpoints[i];
+
+		printc_dbg("picofet: refresh breakpoint %d: type=%d "
+			   "addr=%04x flags=%04x\n",
+			   i, bp->type, bp->addr, bp->flags);
+
+		if ((bp->flags &  DEVICE_BP_DIRTY) &&
+		    (bp->type  == DEVICE_BPTYPE_BREAK)) {
+			addr = bp->addr;
+
+			if (!(bp->flags & DEVICE_BP_ENABLED)) {
+				addr = 0;
+			}
+
+			ok = do_command(pfet, NULL, "BREAK:SET %d %"PRIx32"\r\n", i, addr);
+			all_ok &= ok;
+
+			if (ok) {
+				bp->flags &= ~DEVICE_BP_DIRTY;
+			} else {
+				printc_err("picofet: failed to refresh "
+					   "breakpoint #%d\n", i);
+			}
+		}
+	}
+
+	return all_ok;
 }
 
 static int pfet_erase(device_t dev, device_erase_type_t type, address_t address)
@@ -457,7 +493,9 @@ static int pfet_ctl(device_t dev, device_ctl_t op)
 		break;
 
 	case DEVICE_CTL_RUN:
-		// TODO transfer changed breakpoints to device
+		// Transfer changed breakpoints to device
+		ok = pfet_refresh_bps(dev, pfet);
+		if (!ok) return -1;
 		ok = do_command(pfet, NULL, "MCU:CONTINUE\r\n");
 		break;
 
@@ -509,7 +547,7 @@ static int pfet_getconfigfuses(device_t dev)
 	address_t fuses;
 	bool ok;
 
-	ok = do_command(pfet, NULL, "FUSES:READ\r\n");
+	ok = do_command(pfet, NULL, "FUSES:GET_CONFIG\r\n");
 	if (!ok) return 0;
 	ok = recv_address(pfet, &fuses);
 	if (!ok) return 0;
