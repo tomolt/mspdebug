@@ -318,7 +318,7 @@ static device_t pfet_open(const struct device_args *args)
 
 	memset(pfet, 0, sizeof *pfet);
 	pfet->device.type = &device_picofet;
-	//pfet->device.max_breakpoints = 2; // supported by all devices
+	pfet->device.max_breakpoints = 2; // supported by all devices
 	pfet->device.need_probe = 1;
 	pfet->tran = tran;
 
@@ -415,7 +415,7 @@ static bool pfet_refresh_bps(device_t dev, struct pfet *pfet)
 				addr = 0;
 			}
 
-			ok = do_command(pfet, NULL, "BREAK:SET %d %"PRIx32"\r\n", i, addr);
+			ok = do_command(pfet, NULL, "BREAK:SET %d 0x%"PRIx32"\r\n", i, addr);
 			all_ok &= ok;
 
 			if (ok) {
