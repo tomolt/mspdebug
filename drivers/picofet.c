@@ -188,7 +188,9 @@ static bool do_command(struct pfet *pfet, int *out_status, const char *format, .
 	if (length < 0) return false;
 	va_end(va);
 
+#if 0
 	printc_dbg("picofet: do_command: %.*s", length, pfet->buffer);
+#endif
 
 	ok = send_message(pfet, pfet->buffer, length);
 	if (!ok) return false;
